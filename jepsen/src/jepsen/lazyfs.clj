@@ -19,6 +19,10 @@
             [clj-commons.slingshot :refer [try+ throw+]])
   (:import (java.io File)))
 
+(def all-commands
+  "A set of all supported lazyfs' commands."
+  #{:checkpoint :lose-unfsynced-writes :unsynced-data-report})
+
 (def repo-url
   "Where can we clone lazyfs from?"
   "https://github.com/dsrhaslab/lazyfs.git")
@@ -262,33 +266,70 @@ log_all_operations=false
         (fifo! db-or-lazyfs-map "lazyfs::cache-checkpoint")
         :done)))
 
+(defn unsynced-data-report!
+  "Reports unsynced data.
+   Displays the inodes that have data in the cache, unfsynced writes, for the given lazyfs-map or DB."
+  [db-or-lazyfs-map]
+  (let [lazyfs-map (if (instance? DB db-or-lazyfs-map)
+                     (:lazyfs db-or-lazyfs-map)
+                     db-or-lazyfs-map)
+        fifo-cmd   "lazyfs::unsynced-data-report"]
+    (fifo! lazyfs-map fifo-cmd))
+  :unsynced-data-report)
+
+(defrecord LazyFSNemesis [lazyfs-map]
+  nemesis/Reflection
+  (fs [_this]
+    all-commands)
+
+  nemesis/Nemesis
+  (setup!
+    [this _test]
+    this)
+
+  (invoke!
+    [_this test {:keys [f value] :as op}]
+    (let [result (case f
+                   :checkpoint
+                   (c/with-nodes test value
+                     (checkpoint! lazyfs-map))
+
+                   :lose-unfsynced-writes
+                   (c/with-nodes test value
+                     (lose-unfsynced-writes! lazyfs-map))
+
+                   :unsynced-data-report
+                   (c/with-nodes test value
+                     (unsynced-data-report! lazyfs-map)))
+          result (->> result
+                      (into (sorted-map)))]
+      (assoc op :value result)))
+
+  (teardown!
+    [_this _test]))
+
 (defn nemesis
-  "A nemesis which inject faults into the given lazyfs map by writing to its
-  fifo. Types of faults (:f) supported:
+  "A nemesis which injects commands and faults into the given lazyfs map
+  by writing to its fifo. Supported commands and faults (:f):
+
+  :checkpoint
+
+      Forces any writes in the lazyfs cache. i.e. unfsynced writes,
+      to be flushed to disk.
 
   :lose-unfsynced-writes
 
       Forgets any writes which were not fsynced. The
       :value should be a list of nodes you'd like to lose un-fsynced writes on.
 
+  :unsynced-data-report
+
+      Displays the inodes that have data in the cache,
+      i.e. unfsynced writes.
+
   You don't necessarily need to use this--I haven't figured out how to
   integrate it well into jepsen.nemesis combined. Once we start getting other
   classes of faults it will probably make sense for this nemesis to get more
   use and expand."
-  [lazyfs]
-  (reify nemesis/Nemesis
-    (setup! [this test]
-      this)
-
-    (invoke! [this test op]
-      (case (:f op)
-        :lose-unfsynced-writes
-        (let [v (c/on-nodes test (:value op)
-                            (fn [_ _] (lose-unfsynced-writes! lazyfs)))]
-            (assoc op :value v))))
-
-    (teardown! [this test])
-
-    nemesis/Reflection
-    (fs [this]
-      #{:lose-unfsynced-writes})))
+  [lazyfs-map]
+ (LazyFSNemesis. lazyfs-map))

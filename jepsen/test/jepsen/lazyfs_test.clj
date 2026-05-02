@@ -88,6 +88,18 @@
    :f     :lose-unfsynced-writes
    :value [node]})
 
+(def checkpoint-op
+  "A `checkpoint` op for [[node]]."
+  {:type  :info
+   :f     :checkpoint
+   :value [node]})
+
+(def unsynced-data-report-op
+  "An `unsynced-data-report` op for [[node]]."
+  {:type  :info
+   :f     :unsynced-data-report
+   :value [node]})
+
 (def fsync-lock
   "Object to coordinate Client's write/fsync and Nemesis' `lose-unfsynced-writes`."
   (Object.))
@@ -137,7 +149,7 @@
   nemesis/Reflection
   (fs
     [_this]
-    #{:lose-unfsynced-writes}))
+    lazyfs/all-commands))
 
 ; The `FileSetClient` will fsync writes if the `op` contains `{:fsync? true}`.
 (defrecord FileSetClient []
@@ -198,14 +210,17 @@
    (gen/clients (read-op true))))
 
 (defn phased-gen
-  "Given a `fsync?` flag,
+  "Given `fsync?` and `checkpoint?` flags,
    returns a generator that does in phases:
 
    - 100 writes, unfsynced
+   - unsynced data report
    - optionally fsyncs
+   - optionally checkpoints
+   - unsynced data report
    - loses unfsynced writes
    - final read"
-  [fsync?]
+  [fsync? checkpoint?]
   (gen/phases
    (gen/log "100 writes (unfsynced)...")
    (->> (write-ops false)
@@ -213,10 +228,20 @@
         (gen/delay 1/100)
         (gen/clients))
 
+   (gen/log "unsynced data report")
+   (gen/nemesis unsynced-data-report-op)
+
    (when fsync?
      (gen/log "fsyncing")
      (gen/clients fsync-op))
+   
+   (when checkpoint?
+     (gen/log "checkpointing")
+     (gen/nemesis checkpoint-op))
 
+   (gen/log "unsynced data report")
+   (gen/nemesis unsynced-data-report-op)
+   
    (gen/log "losing unfsynced writes")
    (gen/nemesis lose-unfsynced-writes-op)
 
@@ -224,10 +249,13 @@
    (gen/clients (read-op true))))
 
 (defn test-map
-  "Given a `type`, one of `#{:interleaved :phased}`, and a `fsync?` flag,
+  "Given a `type`, one of `#{:interleaved :phased}`,
+   and `fsync?` and `checkpoint?` flags,
    returns a test map that writes/read to a unique file in [[dir]],
-   using `type` of generator and optionally fsyncing writes."
-  [type fsync?]
+   - using `type` of generator
+   - optionally fsyncing writes
+   - optionally checkpointing writes."
+  [type fsync? checkpoint?]
   (assert (#{:interleaved :phased} type))
   (let [lazyfs-map      (lazyfs/lazyfs dir)
         wrapped-db      (-> lazyfs-map
@@ -238,7 +266,7 @@
                             (WrappedNemesis. fsync?))
         generator       (case type
                           :interleaved (interleaved-gen fsync?)
-                          :phased      (phased-gen      fsync?))]
+                          :phased      (phased-gen      fsync? checkpoint?))]
     (assoc tests/noop-test
            :name      "lazyfs file set"
            :os        debian/os
@@ -250,17 +278,20 @@
            :nodes     [node])))
 
 (deftest ^:integration lazyfs-test
-  (let [interleaved-unfsynced-map  (test-map :interleaved false)
+  (let [interleaved-unfsynced-map  (test-map :interleaved false false)
         interleaved-unfsynced-test (jepsen/run! interleaved-unfsynced-map)
 
-        interleaved-synced-map  (test-map :interleaved true)
+        interleaved-synced-map  (test-map :interleaved true false)
         interleaved-synced-test (jepsen/run! interleaved-synced-map)
 
-        phased-unfsynced-map  (test-map :phased false)
+        phased-unfsynced-map  (test-map :phased false false)
         phased-unfsynced-test (jepsen/run! phased-unfsynced-map)
 
-        phased-synced-map  (test-map :phased true)
-        phased-synced-test (jepsen/run! phased-synced-map)]
+        phased-synced-map  (test-map :phased true false)
+        phased-synced-test (jepsen/run! phased-synced-map)
+
+        phased-checkpointed-map  (test-map :phased false true)
+        phased-checkpointed-test (jepsen/run! phased-checkpointed-map)]
 
     ; unfsynced writes, interleaved generator 
     (let [{:keys [acknowledged-count attempt-count ok-count lost-count recovered-count unexpected-count valid?]}
@@ -289,6 +320,13 @@
     ; unfsynced writes, phased generator
     (let [{:keys [acknowledged-count attempt-count ok-count lost-count recovered-count unexpected-count valid?]}
           (-> phased-synced-test :results)]
+      (is valid?)
+      (is (= acknowledged-count attempt-count ok-count))
+      (is (= 0 lost-count recovered-count unexpected-count)))
+    
+    ; checkpointed writes, phased generator
+    (let [{:keys [acknowledged-count attempt-count ok-count lost-count recovered-count unexpected-count valid?]}
+          (-> phased-checkpointed-test :results)]
       (is valid?)
       (is (= acknowledged-count attempt-count ok-count))
       (is (= 0 lost-count recovered-count unexpected-count)))))
